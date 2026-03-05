@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Odoo POS DevTools</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Odoo POS DevTools</h1>
+
+    <!-- Connection Status -->
+    <div class="section">
+      <div class="status-row">
+        <span id="status-dot" class="dot red"></span>
+        <span id="status-text">Not connected</span>
+      </div>
+      <div id="redux-warning" class="warning hidden">
+        Redux DevTools extension not detected.
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div class="section">
+      <h2>Settings</h2>
+      <label class="setting">
+        <span>Debounce (ms)</span>
+        <input type="number" id="debounce-input" min="10" max="1000" value="50" />
+      </label>
+      <label class="setting">
+        <span>Poll interval (ms)</span>
+        <input type="number" id="poll-input" min="100" max="5000" value="500" />
+      </label>
+    </div>
+
+    <!-- Actions -->
+    <div class="section">
+      <button id="refresh-btn" class="btn">Refresh Snapshot</button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

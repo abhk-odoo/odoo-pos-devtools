@@ -1,0 +1,16 @@
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Extension specific
+*.crx
+*.pem
+*.zip
+dist/
