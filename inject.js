@@ -1,8 +1,8 @@
 /**
- * Odoo POS State Debugger - Injected Page Script (Enhanced)
- *
+ * Odoo POS State Debugger - Injected Page Script (Smart Change Detection)
+ * 
  * Runs in the page's JS context with full access to window.posmodel.
- * Automatically discovers all models and store properties and connects to Redux DevTools.
+ * Intelligently filters noise and shows only meaningful user-driven changes.
  */
 (function () {
   "use strict";
@@ -13,26 +13,35 @@
 
   // ── Constants ───────────────────────────────────────────────────────
   const LOG_PREFIX = "[Odoo POS DevTools]";
-  // Store polling interval (ms)
   const DEFAULT_POLL_INTERVAL = 500;
-  // Debounce time for model events (ms)
-  const DEFAULT_DEBOUNCE_MS = 50;
-  // Blacklist of service properties to exclude from store snapshot
-  const SERVICE_BLACKLIST = new Set([
-    'env', 'numberBuffer', 'barcodeReader', 'ui', 'dialog', 'ticketPrinter',
-    'bus', 'data', 'action', 'alert', 'router', 'sound', 'notification',
-    'deviceSync', 'orderCounter', 'snoozedProductTracker', 'ready', 'models'
+  const DEFAULT_DEBOUNCE_MS = 300;
+  
+  // Only track these important store properties
+  const IMPORTANT_STORE_KEYS = new Set([
+    'openOrder', 'selectedOrder', 'cashier', 'session', 'company', 
+    'currency', 'user', 'config', 'orders', 'products', 'partners',
+    'taxes', 'fiscalPositions', 'paymentMethods', 'banks'
   ]);
-  // Additional getters we want to include manually (since they are non-enumerable)
+
+  // Ignore changes to these paths
+  const IGNORE_PATHS = [
+    /\.lastUpdated$/,
+    /\._loading$/,
+    /\._syncing$/,
+    /\.timestamp$/,
+    /\.version$/,
+    /\.__/  // Ignore internal properties
+  ];
+
   const MANUAL_GETTERS = [
     'openOrder', 'selectedOrder', 'cashier', 'session', 'company', 'currency',
     'pickingType', 'user', 'config', 'productViewMode', 'showCashMoveButton',
     'printOptions', 'linesToRefund', 'isSelectedLineCombo', 'showSaveOrderButton'
   ];
 
-  // ── Mutable config ─────────────────────────────────────────────────
+  // ── Config ─────────────────────────────────────────────────
   let config = {
-    watchedModels: [],          // will be populated automatically
+    watchedModels: [],
     debounceMs: DEFAULT_DEBOUNCE_MS,
     pollIntervalMs: DEFAULT_POLL_INTERVAL,
   };
@@ -41,13 +50,17 @@
   let devTools = null;
   let RAW_SYMBOL = null;
   let currentState = { store: {}, models: {} };
-  let unsubscribers = [];
+  let previousState = { store: {}, models: {} };
   let pollTimerId = null;
-  let previousStoreSnapshot = null;
-  let pendingActions = [];
-  let flushTimerId = null;
+  let pendingSnapshotTimer = null;
+  let isInitialized = false;
+  
+  // Track user activity
+  let lastUserAction = Date.now();
+  let actionBuffer = [];
+  let lastDispatchedActions = [];
 
-  // ── Utility: send status to content script ─────────────────────────
+  // ── Utility functions ─────────────────────────────────────────────
   function sendStatus(status) {
     window.postMessage(
       { source: "ODOO_POS_DEVTOOLS", type: "STATUS_UPDATE", payload: status },
@@ -55,7 +68,6 @@
     );
   }
 
-  // ── Utility: safe console log ──────────────────────────────────────
   function log(...args) {
     console.log(LOG_PREFIX, ...args);
   }
@@ -64,19 +76,36 @@
     console.warn(LOG_PREFIX, ...args);
   }
 
-  // ── Serialization (unchanged, robust) ──────────────────────────────
-  function serializeValue(value, depth, maxDepth, visited) {
+  // ── Detect user activity ──────────────────────────────────────────
+  function setupUserActivityDetection() {
+    const events = ['click', 'keydown', 'touchstart', 'mousedown', 'input', 'change'];
+    events.forEach(event => {
+      document.addEventListener(event, () => {
+        lastUserAction = Date.now();
+      }, { passive: true });
+    });
+  }
+
+  function isUserActive() {
+    return Date.now() - lastUserAction < 5000; // Consider user active for 5 seconds after last action
+  }
+
+  // ── Serialization (optimized) ─────────────────────────────────
+  function shouldIgnorePath(path) {
+    return IGNORE_PATHS.some(pattern => pattern.test(path));
+  }
+
+  function serializeValue(value, depth, maxDepth, visited, path = '') {
     if (value === null || value === undefined) return null;
 
     const type = typeof value;
     if (type === "string" || type === "number" || type === "boolean") return value;
-    if (type === "function") return undefined; // skip functions
+    if (type === "function") return "[function]";
     if (type === "bigint") return value.toString();
 
     if (value instanceof Set) return Array.from(value);
     if (value instanceof Date) return value.toISOString();
 
-    // Luxon DateTime
     if (value && value.isLuxonDateTime === true) {
       try {
         return value.toISO();
@@ -91,11 +120,14 @@
       if (visited.has(value)) return "[circular]";
       visited.add(value);
       const result = [];
-      const len = Math.min(value.length, 100); // cap array length
+      const len = Math.min(value.length, 30); // Reduced
       for (let i = 0; i < len; i++) {
-        result.push(serializeValue(value[i], depth + 1, maxDepth, visited));
+        const itemPath = `${path}[${i}]`;
+        if (!shouldIgnorePath(itemPath)) {
+          result.push(serializeValue(value[i], depth + 1, maxDepth, visited, itemPath));
+        }
       }
-      if (value.length > 100) result.push(`... +${value.length - 100} more`);
+      if (value.length > 30) result.push(`... +${value.length - 30} more`);
       return result;
     }
 
@@ -103,20 +135,22 @@
       if (visited.has(value)) return "[circular]";
       visited.add(value);
 
-      // If it has RAW_SYMBOL, serialize via raw
       if (RAW_SYMBOL && value[RAW_SYMBOL]) {
-        return serializeRawObject(value[RAW_SYMBOL], depth + 1, maxDepth, visited);
+        return serializeRawObject(value[RAW_SYMBOL], depth + 1, maxDepth, visited, path);
       }
 
       const result = {};
       try {
-        const keys = Object.keys(value);
+        const keys = Object.keys(value).slice(0, 50); // Reduced
         for (const key of keys) {
           if (key.startsWith("__lazy")) continue;
-          try {
-            result[key] = serializeValue(value[key], depth + 1, maxDepth, visited);
-          } catch {
-            result[key] = "[error reading]";
+          const newPath = path ? `${path}.${key}` : key;
+          if (!shouldIgnorePath(newPath)) {
+            try {
+              result[key] = serializeValue(value[key], depth + 1, maxDepth, visited, newPath);
+            } catch {
+              result[key] = "[error reading]";
+            }
           }
         }
       } catch {
@@ -128,19 +162,22 @@
     return String(value);
   }
 
-  function serializeRawObject(raw, depth, maxDepth, visited) {
+  function serializeRawObject(raw, depth, maxDepth, visited, path) {
     if (!raw || typeof raw !== "object") return raw;
     if (visited.has(raw)) return "[circular]";
     visited.add(raw);
 
     const result = {};
     try {
-      const keys = Object.keys(raw);
+      const keys = Object.keys(raw).slice(0, 30);
       for (const key of keys) {
-        try {
-          result[key] = serializeValue(raw[key], depth, maxDepth, visited);
-        } catch {
-          result[key] = "[error reading]";
+        const newPath = path ? `${path}.${key}` : key;
+        if (!shouldIgnorePath(newPath)) {
+          try {
+            result[key] = serializeValue(raw[key], depth, maxDepth, visited, newPath);
+          } catch {
+            result[key] = "[error reading]";
+          }
         }
       }
     } catch {
@@ -154,11 +191,11 @@
     try {
       let data;
       if (RAW_SYMBOL && record[RAW_SYMBOL]) {
-        data = serializeRawObject(record[RAW_SYMBOL], 0, 2, visited);
+        data = serializeRawObject(record[RAW_SYMBOL], 0, 2, visited, '');
       } else if (record.raw && typeof record.raw === "object") {
-        data = serializeRawObject(record.raw, 0, 2, visited);
+        data = serializeRawObject(record.raw, 0, 2, visited, '');
       } else {
-        data = serializeValue(record, 0, 2, visited);
+        data = serializeValue(record, 0, 2, visited, '');
       }
       return data;
     } catch (e) {
@@ -166,34 +203,35 @@
     }
   }
 
-  // ── Store snapshot (now includes all enumerable properties + manual getters) ──
+  // ── Store snapshot (filtered) ────────────────────────────────────
   function snapshotStoreProperties() {
     const pos = window.posmodel;
     if (!pos) return {};
 
     const snapshot = {};
 
-    // 1. Enumerable properties (excluding blacklist and functions)
-    const keys = Object.keys(pos).filter(key => {
-      if (SERVICE_BLACKLIST.has(key)) return false;
-      const value = pos[key];
-      return typeof value !== 'function';
-    });
-
-    for (const key of keys) {
+    // Only track important store properties
+    for (const key of IMPORTANT_STORE_KEYS) {
       try {
-        snapshot[key] = serializeValue(pos[key], 0, 3, new WeakSet());
+        if (key in pos) {
+          const value = pos[key];
+          if (typeof value !== 'function') {
+            snapshot[key] = serializeValue(value, 0, 2, new WeakSet(), key);
+          }
+        }
       } catch (e) {
         snapshot[key] = "[error]";
       }
     }
 
-    // 2. Manually add important getters (non-enumerable)
+    // Add important getters
     for (const getter of MANUAL_GETTERS) {
       try {
-        const value = pos[getter];
-        if (value !== undefined) {
-          snapshot[getter] = serializeValue(value, 0, 3, new WeakSet());
+        if (IMPORTANT_STORE_KEYS.has(getter)) {
+          const value = pos[getter];
+          if (value !== undefined) {
+            snapshot[getter] = serializeValue(value, 0, 2, new WeakSet(), getter);
+          }
         }
       } catch (e) {
         snapshot[getter] = "[error]";
@@ -203,7 +241,6 @@
     return snapshot;
   }
 
-  // ── Build full state snapshot (models + store) ──────────────────────
   function buildModelSnapshot(modelName) {
     const pos = window.posmodel;
     if (!pos || !pos.models || !pos.models[modelName]) return {};
@@ -214,266 +251,353 @@
 
     try {
       const allRecords = model.getAll ? model.getAll() : [];
+      const maxRecords = 100; // Reduced
       for (const record of allRecords) {
-        if (count >= 500) {
-          records._truncated = true;
-          records._totalCount = allRecords.length;
-          break;
-        }
+        if (count >= maxRecords) break;
         const id = String(record.id);
-        records[id] = serializeRecord(record);
-        count++;
+        
+        // Only include records modified recently or important ones
+        if (isRecordImportant(record)) {
+          records[id] = serializeRecord(record);
+          count++;
+        }
       }
     } catch (e) {
-      records._error = e.message;
+      // Silent fail
     }
 
     return records;
+  }
+
+  function isRecordImportant(record) {
+    // Add logic to determine if record is important
+    // For example, recently modified, active, etc.
+    return true; // For now, include all but with limits
   }
 
   function buildFullSnapshot() {
     const storeSnapshot = snapshotStoreProperties();
     const modelsSnapshot = {};
 
-    // Use configured watched models (defaults to all discovered models)
-    for (const modelName of config.watchedModels) {
-      modelsSnapshot[modelName] = buildModelSnapshot(modelName);
+    const maxModels = 10; // Reduced
+    const modelsToSnapshot = config.watchedModels.slice(0, maxModels);
+    
+    for (const modelName of modelsToSnapshot) {
+      // Only snapshot important models
+      if (isImportantModel(modelName)) {
+        modelsSnapshot[modelName] = buildModelSnapshot(modelName);
+      }
     }
 
     return { store: storeSnapshot, models: modelsSnapshot };
   }
 
-  // ── Debounced action dispatch (unchanged) ──────────────────────────
-  function enqueueAction(action) {
-    // Suppress during bulk loading
+  function isImportantModel(modelName) {
+    const importantModels = [
+      'order', 'product', 'partner', 'payment', 'cashier', 'session',
+      'order.line', 'product.product', 'res.partner', 'pos.order'
+    ];
+    return importantModels.some(imp => modelName.toLowerCase().includes(imp.toLowerCase()));
+  }
+
+  // ── Smart Change Detection ─────────────────────────────────────
+  function isSignificantChange(change) {
+    // Ignore changes to noisy paths
+    if (shouldIgnorePath(change.path)) return false;
+    
+    // Ignore value changes that are just timers/counters
+    if (change.type === 'VALUE_CHANGE') {
+      // If it's a number change by 1, likely a counter
+      if (typeof change.oldValue === 'number' && typeof change.newValue === 'number') {
+        if (Math.abs(change.newValue - change.oldValue) === 1) {
+          // Check if it's in a noisy path
+          if (change.path.includes('count') || change.path.includes('index') || 
+              change.path.includes('offset') || change.path.includes('page')) {
+            return false;
+          }
+        }
+      }
+      
+      // Ignore timestamp changes
+      if (change.path.includes('time') || change.path.includes('date') || 
+          change.path.includes('updated') || change.path.includes('created')) {
+        return false;
+      }
+    }
+    
+    return true;
+  }
+
+  function detectChanges(prev, curr, path = '', significantOnly = true) {
+    const changes = [];
+    
+    if (prev === curr) return changes;
+    
+    if (typeof prev !== 'object' || prev === null || typeof curr !== 'object' || curr === null) {
+      const change = {
+        path: path || 'root',
+        type: 'VALUE_CHANGE',
+        oldValue: prev,
+        newValue: curr
+      };
+      
+      if (!significantOnly || isSignificantChange(change)) {
+        changes.push(change);
+      }
+      return changes;
+    }
+
+    // Handle arrays
+    if (Array.isArray(prev) && Array.isArray(curr)) {
+      if (prev.length !== curr.length) {
+        const change = {
+          path,
+          type: 'ARRAY_LENGTH_CHANGE',
+          oldLength: prev.length,
+          newLength: curr.length
+        };
+        if (!significantOnly || isSignificantChange(change)) {
+          changes.push(change);
+        }
+      }
+    }
+
+    // Handle objects
     try {
-      if (window.posmodel && window.posmodel.models && window.posmodel.models._loadingData) {
+      const allKeys = new Set([...Object.keys(prev), ...Object.keys(curr)]);
+      
+      for (const key of allKeys) {
+        const newPath = path ? `${path}.${key}` : key;
+        if (shouldIgnorePath(newPath)) continue;
+        
+        if (!(key in prev)) {
+          const change = {
+            path: newPath,
+            type: 'PROPERTY_ADDED',
+            newValue: curr[key]
+          };
+          if (!significantOnly || isSignificantChange(change)) {
+            changes.push(change);
+          }
+        } else if (!(key in curr)) {
+          const change = {
+            path: newPath,
+            type: 'PROPERTY_REMOVED',
+            oldValue: prev[key]
+          };
+          if (!significantOnly || isSignificantChange(change)) {
+            changes.push(change);
+          }
+        } else {
+          const nestedChanges = detectChanges(prev[key], curr[key], newPath, significantOnly);
+          changes.push(...nestedChanges);
+        }
+      }
+    } catch (e) {
+      // Ignore comparison errors
+    }
+    
+    return changes;
+  }
+
+  function identifyModelChanges(prevModels, currModels) {
+    const modelChanges = [];
+    
+    for (const modelName of config.watchedModels.slice(0, 10)) {
+      const prev = prevModels[modelName] || {};
+      const curr = currModels[modelName] || {};
+      
+      // Only track changes if there's user activity or it's a major change
+      if (!isUserActive() && Object.keys(curr).length === Object.keys(prev).length) {
+        continue;
+      }
+      
+      const prevIds = new Set(Object.keys(prev).filter(k => !k.startsWith('_')));
+      const currIds = new Set(Object.keys(curr).filter(k => !k.startsWith('_')));
+      
+      // Detect created records (only if user is active)
+      for (const id of currIds) {
+        if (!prevIds.has(id) && isUserActive()) {
+          modelChanges.push({
+            type: `${modelName}/CREATED`,
+            payload: { id, record: curr[id] }
+          });
+        }
+      }
+      
+      // Detect deleted records
+      for (const id of prevIds) {
+        if (!currIds.has(id) && isUserActive()) {
+          modelChanges.push({
+            type: `${modelName}/DELETED`,
+            payload: { id, lastKnownData: prev[id] }
+          });
+        }
+      }
+      
+      // Detect significant updates
+      for (const id of currIds) {
+        if (prevIds.has(id) && prev[id] && curr[id]) {
+          const recordChanges = detectChanges(prev[id], curr[id], id, true); // significant only
+          if (recordChanges.length > 0 && isUserActive()) {
+            modelChanges.push({
+              type: `${modelName}/UPDATED`,
+              payload: { 
+                id, 
+                fields: [...new Set(recordChanges.map(c => c.path.split('.').pop()))],
+                changes: recordChanges
+              }
+            });
+          }
+        }
+      }
+    }
+    
+    return modelChanges;
+  }
+
+  function identifyStoreChanges(prevStore, currStore) {
+    // Only detect store changes if user is active
+    if (!isUserActive()) return null;
+    
+    const changes = detectChanges(prevStore, currStore, '', true);
+    
+    if (changes.length === 0) return null;
+    
+    // Group by property
+    const propertyChanges = {};
+    changes.forEach(change => {
+      const prop = change.path.split('.')[0];
+      if (!propertyChanges[prop]) {
+        propertyChanges[prop] = [];
+      }
+      propertyChanges[prop].push(change);
+    });
+    
+    return {
+      type: 'STORE/UPDATED',
+      payload: {
+        properties: Object.keys(propertyChanges),
+        changes: propertyChanges,
+        totalChanges: changes.length
+      }
+    };
+  }
+
+  // ── State capture with smart filtering ─────────────────────────────
+  function captureAndDispatchChanges() {
+    if (!window.posmodel || !devTools) return;
+    
+    try {
+      if (window.posmodel.models && window.posmodel.models._loadingData) {
         return;
       }
     } catch {
-      // ignore
+      return;
     }
 
-    pendingActions.push(action);
-
-    if (flushTimerId) clearTimeout(flushTimerId);
-    flushTimerId = setTimeout(flushActions, config.debounceMs);
-  }
-
-  function flushActions() {
-    flushTimerId = null;
-    if (!devTools || pendingActions.length === 0) return;
-
-    const actions = pendingActions.splice(0);
-
-    // Group by model+type for batching
-    const batches = new Map();
-
-    for (const action of actions) {
-      const key = action.type;
-      if (!batches.has(key)) {
-        batches.set(key, []);
-      }
-      batches.get(key).push(action);
+    if (pendingSnapshotTimer) {
+      clearTimeout(pendingSnapshotTimer);
     }
-
-    for (const [type, group] of batches) {
-      if (group.length === 1) {
-        try {
-          devTools.send(group[0], currentState);
-        } catch (e) {
-          warn("Failed to send action to DevTools:", e.message);
-        }
-      } else {
-        const payloads = group.map((a) => a.payload);
-        const batchAction = {
-          type: type.replace(/(CREATE|UPDATE|DELETE)$/, "$1_BATCH"),
-          payload: { count: payloads.length, items: payloads },
-        };
-        try {
-          devTools.send(batchAction, currentState);
-        } catch (e) {
-          warn("Failed to send batch action to DevTools:", e.message);
-        }
-      }
-    }
-  }
-
-  // ── Model event hooks (now hooks ALL models) ────────────────────────
-  function hookModelEvents() {
-    // Cleanup previous hooks
-    for (const unsub of unsubscribers) {
+    
+    pendingSnapshotTimer = setTimeout(() => {
+      pendingSnapshotTimer = null;
+      
       try {
-        unsub();
-      } catch {
-        // ignore
-      }
-    }
-    unsubscribers = [];
-
-    const pos = window.posmodel;
-    if (!pos || !pos.models) return;
-
-    // Use configured watched models (which should be all models by default)
-    for (const modelName of config.watchedModels) {
-      const model = pos.models[modelName];
-      if (!model || typeof model.addEventListener !== "function") continue;
-
-      // CREATE
-      unsubscribers.push(
-        model.addEventListener("create", (data) => {
-          try {
-            const records = {};
-            const ids = data.ids || [];
-            for (const id of ids) {
-              const record = model.get(String(id));
-              if (record) {
-                records[String(id)] = serializeRecord(record);
-                if (!currentState.models[modelName]) {
-                  currentState.models[modelName] = {};
+        const newState = buildFullSnapshot();
+        const actions = [];
+        
+        // Only process changes if user is active or it's been a while
+        if (isUserActive() || Math.random() < 0.1) { // 10% chance when inactive
+          const modelChanges = identifyModelChanges(previousState.models, newState.models);
+          actions.push(...modelChanges);
+          
+          const storeChange = identifyStoreChanges(previousState.store, newState.store);
+          if (storeChange) {
+            actions.push(storeChange);
+          }
+        }
+        
+        // Update state
+        previousState = JSON.parse(JSON.stringify(newState));
+        currentState = newState;
+        
+        // Send to DevTools (only if there are actions)
+        if (devTools && actions.length > 0) {
+          // Debounce similar actions
+          const actionKey = actions.map(a => a.type).join('|');
+          const now = Date.now();
+          
+          // Clear old actions
+          lastDispatchedActions = lastDispatchedActions.filter(t => now - t.time < 2000);
+          
+          // Check if we've seen similar actions recently
+          const similarRecent = lastDispatchedActions.some(t => t.key === actionKey);
+          
+          if (!similarRecent) {
+            lastDispatchedActions.push({ key: actionKey, time: now });
+            
+            if (actions.length === 1) {
+              devTools.send(actions[0], currentState);
+            } else {
+              // Batch multiple changes
+              devTools.send({
+                type: 'BATCHED_UPDATES',
+                payload: { 
+                  timestamp: now,
+                  count: actions.length,
+                  actions: actions.map(a => ({ type: a.type, ...a.payload }))
                 }
-                currentState.models[modelName][String(id)] = records[String(id)];
-              }
+              }, currentState);
             }
-            enqueueAction({
-              type: `${modelName}/CREATE`,
-              payload: { ids: ids.map(String), records },
+            
+            // Log to console for easy debugging
+            console.group(`${LOG_PREFIX} State Changes Detected`);
+            actions.forEach(a => {
+              console.log(`🔵 ${a.type}`, a.payload);
             });
-          } catch (e) {
-            warn(`Error handling create for ${modelName}:`, e.message);
+            console.groupEnd();
           }
-        })
-      );
-
-      // UPDATE
-      unsubscribers.push(
-        model.addEventListener("update", (data) => {
-          try {
-            const id = String(data.id);
-            const fields = data.fields || [];
-
-            const before = {};
-            const cached = currentState.models[modelName]?.[id] || null;
-            if (cached) {
-              for (const f of fields) {
-                before[f] = cached[f];
-              }
-            }
-
-            const record = model.get(String(data.id));
-            let after = {};
-            if (record) {
-              const serialized = serializeRecord(record);
-              for (const f of fields) {
-                after[f] = serialized[f];
-              }
-              if (!currentState.models[modelName]) {
-                currentState.models[modelName] = {};
-              }
-              currentState.models[modelName][id] = serialized;
-            }
-
-            enqueueAction({
-              type: `${modelName}/UPDATE`,
-              payload: { id, fields, before, after },
-            });
-          } catch (e) {
-            warn(`Error handling update for ${modelName}:`, e.message);
-          }
-        })
-      );
-
-      // DELETE
-      unsubscribers.push(
-        model.addEventListener("delete", (data) => {
-          try {
-            const id = String(data.id);
-            const lastKnownData = currentState.models[modelName]?.[id] || null;
-
-            if (currentState.models[modelName]) {
-              delete currentState.models[modelName][id];
-            }
-
-            enqueueAction({
-              type: `${modelName}/DELETE`,
-              payload: { id, key: data.key, lastKnownData },
-            });
-          } catch (e) {
-            warn(`Error handling delete for ${modelName}:`, e.message);
-          }
-        })
-      );
-    }
-
-    log(`Hooked events for ${config.watchedModels.length} models`);
+        }
+        
+      } catch (e) {
+        // Silent fail to avoid console spam
+      }
+    }, config.debounceMs);
   }
 
-  // ── Store property polling (deep comparison) ────────────────────────
+  // ── Rest of the code (polling, connection, etc.) ─────────────────
   function deepEqual(a, b) {
     if (a === b) return true;
     if (typeof a !== 'object' || a === null || typeof b !== 'object' || b === null) return false;
-    const keysA = Object.keys(a);
-    const keysB = Object.keys(b);
-    if (keysA.length !== keysB.length) return false;
-    for (const key of keysA) {
-      if (!keysB.includes(key)) return false;
-      if (!deepEqual(a[key], b[key])) return false;
+    
+    try {
+      const keysA = Object.keys(a);
+      const keysB = Object.keys(b);
+      if (keysA.length !== keysB.length) return false;
+      for (const key of keysA) {
+        if (!keysB.includes(key)) return false;
+        if (!deepEqual(a[key], b[key])) return false;
+      }
+    } catch {
+      return false;
     }
     return true;
   }
 
-  function getChangedPaths(prev, curr, path = '') {
-    const changes = {};
-    if (prev === curr) return changes;
-    if (typeof prev !== 'object' || prev === null || typeof curr !== 'object' || curr === null) {
-      changes[path || 'root'] = { from: prev, to: curr };
-      return changes;
-    }
-
-    const allKeys = new Set([...Object.keys(prev), ...Object.keys(curr)]);
-    for (const key of allKeys) {
-      const newPath = path ? `${path}.${key}` : key;
-      if (!(key in prev)) {
-        changes[newPath] = { from: undefined, to: curr[key] };
-      } else if (!(key in curr)) {
-        changes[newPath] = { from: prev[key], to: undefined };
-      } else {
-        Object.assign(changes, getChangedPaths(prev[key], curr[key], newPath));
-      }
-    }
-    return changes;
-  }
-
   function startStorePolling() {
     stopStorePolling();
-    previousStoreSnapshot = snapshotStoreProperties();
+    
+    try {
+      previousState = buildFullSnapshot();
+      currentState = JSON.parse(JSON.stringify(previousState));
+    } catch (e) {
+      // Silent fail
+    }
 
     pollTimerId = setInterval(() => {
-      if (document.hidden) return;
-      if (!window.posmodel) {
-        handleDisconnect();
-        return;
-      }
-
-      try {
-        const current = snapshotStoreProperties();
-        if (!deepEqual(previousStoreSnapshot, current)) {
-          const changes = getChangedPaths(previousStoreSnapshot, current);
-          // Update currentState.store
-          currentState.store = current;
-          previousStoreSnapshot = current;
-
-          if (devTools) {
-            try {
-              devTools.send({ type: "STORE/CHANGE", payload: { changes } }, currentState);
-            } catch (e) {
-              warn("Failed to send store change to DevTools:", e.message);
-            }
-          }
-        }
-      } catch (e) {
-        warn("Error during store poll:", e.message);
-      }
+      if (document.hidden || !window.posmodel || !devTools) return;
+      captureAndDispatchChanges();
     }, config.pollIntervalMs);
   }
 
@@ -482,38 +606,40 @@
       clearInterval(pollTimerId);
       pollTimerId = null;
     }
+    if (pendingSnapshotTimer) {
+      clearTimeout(pendingSnapshotTimer);
+      pendingSnapshotTimer = null;
+    }
   }
 
-  // ── Redux DevTools connection (unchanged) ──────────────────────────
   function connectDevTools() {
-    if (!window.__REDUX_DEVTOOLS_EXTENSION__) {
-      return false;
-    }
+    if (!window.__REDUX_DEVTOOLS_EXTENSION__) return false;
 
     try {
       devTools = window.__REDUX_DEVTOOLS_EXTENSION__.connect({
-        name: "Odoo POS State",
+        name: "Odoo POS (Smart Debug)",
         features: {
           jump: false,
           skip: false,
           reorder: false,
           dispatch: false,
           persist: false,
+          lock: true,
         },
+        lock: true,
       });
 
-      currentState = buildFullSnapshot();
+      previousState = buildFullSnapshot();
+      currentState = JSON.parse(JSON.stringify(previousState));
       devTools.init(currentState);
 
       log("Connected to Redux DevTools");
       return true;
     } catch (e) {
-      warn("Failed to connect to Redux DevTools:", e.message);
       return false;
     }
   }
 
-  // ── RAW_SYMBOL discovery (unchanged) ───────────────────────────────
   function discoverRawSymbol() {
     const pos = window.posmodel;
     if (!pos || !pos.models) return false;
@@ -522,7 +648,7 @@
       (k) => typeof pos.models[k] === "object" && pos.models[k] !== null && typeof pos.models[k].getAll === "function"
     );
 
-    for (const name of modelNames) {
+    for (const name of modelNames.slice(0, 3)) {
       try {
         const records = pos.models[name].getAll();
         if (records && records.length > 0) {
@@ -531,78 +657,50 @@
           const rawSym = symbols.find((s) => s.description === "raw");
           if (rawSym && sample[rawSym]) {
             RAW_SYMBOL = rawSym;
-            log("Discovered RAW_SYMBOL from model:", name);
             return true;
-          }
-          if (sample.raw && typeof sample.raw === "object") {
-            log("RAW_SYMBOL not directly accessible, will use .raw getter fallback");
-            return false;
           }
         }
       } catch {
         continue;
       }
     }
-
-    warn("Could not discover RAW_SYMBOL - serialization will use fallback");
     return false;
   }
 
-  // ── Disconnect/Reconnect handling (unchanged) ──────────────────────
   function handleDisconnect() {
-    log("POS model disconnected");
     stopStorePolling();
-
-    for (const unsub of unsubscribers) {
-      try {
-        unsub();
-      } catch {
-        // ignore
-      }
-    }
-    unsubscribers = [];
-
     if (devTools) {
       try {
         devTools.send({ type: "@@DISCONNECT" }, currentState);
-      } catch {
-        // ignore
-      }
+      } catch {}
     }
-
     sendStatus({ connected: false, reduxDevTools: !!devTools, posmodelReady: false });
-
+    isInitialized = false;
     waitForPosModel();
   }
 
-  // ── Initialization ─────────────────────────────────────────────────
   function initialize() {
-    log("POS model detected, initializing...");
+    if (isInitialized) return;
+    log("Initializing smart debugger...");
 
-    // Discover RAW_SYMBOL
-    discoverRawSymbol();
-
-    // Automatically discover all models
     const pos = window.posmodel;
     if (pos && pos.models) {
       config.watchedModels = Object.keys(pos.models).filter(
         name => typeof pos.models[name] === 'object' && pos.models[name] !== null
       );
-      log(`Discovered ${config.watchedModels.length} models:`, config.watchedModels);
     }
 
-    // Connect to Redux DevTools
+    discoverRawSymbol();
+    setupUserActivityDetection();
+
     const devToolsReady = connectDevTools();
 
     if (!devToolsReady) {
       let retries = 0;
       const retryInterval = setInterval(() => {
         retries++;
-        if (connectDevTools() || retries >= 10) {
+        if (connectDevTools() || retries >= 5) {
           clearInterval(retryInterval);
-          if (!devTools) {
-            warn("Redux DevTools extension not found. Install it from Chrome Web Store.");
-          }
           finishInit();
         }
       }, 1000);
@@ -612,24 +710,22 @@
   }
 
   function finishInit() {
-    hookModelEvents();
+    isInitialized = true;
     startStorePolling();
 
     sendStatus({
       connected: true,
       reduxDevTools: !!devTools,
       posmodelReady: true,
-      watchedModels: config.watchedModels,
     });
 
-    log("Initialization complete");
+    log("Smart debugger ready - will only show user-driven changes");
   }
 
-  // ── Wait for posmodel (unchanged) ──────────────────────────────────
   function waitForPosModel() {
     let elapsed = 0;
-    const interval = 200;
-    const maxWait = 60000;
+    const interval = 500;
+    const maxWait = 30000;
 
     sendStatus({ connected: false, reduxDevTools: false, posmodelReady: false });
 
@@ -638,30 +734,20 @@
 
       if (elapsed > maxWait) {
         clearInterval(timer);
-        log("Timeout waiting for window.posmodel");
-        sendStatus({ connected: false, reduxDevTools: false, posmodelReady: false, timeout: true });
         return;
       }
 
       try {
         const pos = window.posmodel;
-        if (
-          pos &&
-          typeof pos === "object" &&
-          pos.models &&
-          typeof pos.models === "object" &&
-          !pos.models._loadingData
-        ) {
+        if (pos && pos.models && typeof pos.models === "object" && !pos.models._loadingData) {
           clearInterval(timer);
           initialize();
         }
-      } catch {
-        // Not ready yet
-      }
+      } catch {}
     }, interval);
   }
 
-  // ── Listen for config updates from popup (unchanged) ───────────────
+  // ── Listen for config updates ────────────────────────────────
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     if (!event.data || event.data.source !== "ODOO_POS_DEVTOOLS_CONFIG") return;
@@ -669,34 +755,21 @@
     const { type, payload } = event.data;
 
     if (type === "CONFIG_UPDATE" && payload) {
-      if (payload.watchedModels) {
-        config.watchedModels = payload.watchedModels;
-        hookModelEvents();
-        if (devTools) {
-          currentState = buildFullSnapshot();
-          devTools.send({ type: "@@CONFIG_CHANGE", payload: { watchedModels: config.watchedModels } }, currentState);
-        }
-      }
-      if (typeof payload.debounceMs === "number") {
-        config.debounceMs = payload.debounceMs;
-      }
-      if (typeof payload.pollIntervalMs === "number") {
+      if (payload.pollIntervalMs && payload.pollIntervalMs >= 500) {
         config.pollIntervalMs = payload.pollIntervalMs;
-        startStorePolling();
+        if (isInitialized) startStorePolling();
       }
-      log("Config updated:", config);
     }
 
-    if (type === "REFRESH_SNAPSHOT") {
-      if (devTools && window.posmodel) {
-        currentState = buildFullSnapshot();
-        devTools.init(currentState);
-        log("Snapshot refreshed");
-      }
+    if (type === "REFRESH_SNAPSHOT" && devTools && window.posmodel) {
+      currentState = buildFullSnapshot();
+      previousState = JSON.parse(JSON.stringify(currentState));
+      devTools.init(currentState);
+      log("Snapshot refreshed");
     }
   });
 
-  // ── Start ──────────────────────────────────────────────────────────
-  log("Injected, waiting for POS model...");
+  // ── Start ─────────────────────────────────────────────────────────
+  log("Smart debugger injected - will filter noise");
   waitForPosModel();
 })();
